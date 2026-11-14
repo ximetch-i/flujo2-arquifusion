@@ -1,0 +1,8 @@
+{
+  "machine_id": "MAQ-001",
+  "incidente_id": "INC-PRUEBA-001",
+  "severidad": "urgente",
+  "zona": "Lima Norte",
+  "prob_falla": 0.92,
+  "repuesto_id": "REP-001"
+}

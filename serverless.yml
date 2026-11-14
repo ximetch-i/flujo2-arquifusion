@@ -1,0 +1,364 @@
+service: flujo2-arquifusion
+frameworkVersion: '3'
+
+provider:
+  name: aws
+  runtime: python3.12
+  region: us-east-1
+  stage: ${opt:stage, 'dev'}
+  timeout: 30
+  memorySize: 256
+  # Se reutiliza el rol preexistente de AWS Academy. No se crea otro rol IAM.
+  iam:
+    role: arn:aws:iam::${aws:accountId}:role/LabRole
+  environment:
+    MACHINES_TABLE: t_maquinas
+    TECHNICIANS_TABLE: t_tecnicos
+    PARTS_TABLE: t_repuestos
+    INCIDENTS_TABLE: t_incidentes
+    ORDERS_TABLE: t_pedidos_repuesto
+    NOTIFICATIONS_TOPIC_ARN: !Ref TemaNotificaciones
+    STATE_MACHINE_ARN: arn:aws:states:us-east-1:107681881936:stateMachine:FlujoAtencionIncidente
+
+package:
+  individually: false
+  patterns:
+    - '!node_modules/**'
+    - '!**/__pycache__/**'
+    - '!**/*.py[cod]'
+    - '!.git/**'
+    - '!*.zip'
+    - '!README.md'
+    - '!docs/**'
+
+functions:
+  iniciarAtencion:
+    name: flujo2-dev-IniciarAtencion
+    handler: src/iniciar_atencion.lambda_handler
+    events:
+      - sqs:
+          arn: !GetAtt ColaIncidentes.Arn
+          batchSize: 1
+          functionResponseType: ReportBatchItemFailures
+
+  consultarEstadoMaquina:
+    name: flujo2-dev-ConsultarEstadoMaquina
+    handler: src/consultar_estado_maquina.lambda_handler
+
+  asignarTecnico:
+    name: flujo2-dev-AsignarTecnico
+    handler: src/asignar_tecnico.lambda_handler
+
+  verificarRepuestos:
+    name: flujo2-dev-VerificarRepuestos
+    handler: src/verificar_repuestos.lambda_handler
+
+  solicitarRepuesto:
+    name: flujo2-dev-SolicitarRepuesto
+    handler: src/solicitar_repuesto.lambda_handler
+
+  registrarIncidente:
+    name: flujo2-dev-RegistrarIncidente
+    handler: src/registrar_incidente.lambda_handler
+
+  notificarIncidente:
+    name: flujo2-dev-NotificarIncidente
+    handler: src/notificar_incidente.lambda_handler
+
+  consultarEstadoFlota:
+    name: flujo2-dev-ConsultarEstadoFlota
+    handler: src/consultar_estado_flota.lambda_handler
+    events:
+      - http:
+          path: maquinas
+          method: get
+          cors: true
+
+  consultarHistorialIncidentes:
+    name: flujo2-dev-ConsultarHistorialIncidentes
+    handler: src/consultar_historial_incidentes.lambda_handler
+    events:
+      - http:
+          path: incidentes
+          method: get
+          cors: true
+
+resources:
+  Resources:
+    # ---------------- SNS + SQS: entrada de incidentes ----------------
+    TemaIncidentes:
+      Type: AWS::SNS::Topic
+      Properties:
+        TopicName: TemaIncidentes
+
+    ColaIncidentesDLQ:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ColaIncidentesDLQ
+        MessageRetentionPeriod: 1209600
+
+    ColaIncidentes:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ColaIncidentes
+        VisibilityTimeout: 180
+        RedrivePolicy:
+          deadLetterTargetArn: !GetAtt ColaIncidentesDLQ.Arn
+          maxReceiveCount: 3
+
+    PermisoSNSColaIncidentes:
+      Type: AWS::SQS::QueuePolicy
+      Properties:
+        Queues:
+          - !Ref ColaIncidentes
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: sns.amazonaws.com
+              Action: sqs:SendMessage
+              Resource: !GetAtt ColaIncidentes.Arn
+              Condition:
+                ArnEquals:
+                  aws:SourceArn: !Ref TemaIncidentes
+
+    SuscripcionTemaIncidentes:
+      Type: AWS::SNS::Subscription
+      DependsOn: PermisoSNSColaIncidentes
+      Properties:
+        TopicArn: !Ref TemaIncidentes
+        Protocol: sqs
+        Endpoint: !GetAtt ColaIncidentes.Arn
+        RawMessageDelivery: true
+        FilterPolicyScope: MessageBody
+        FilterPolicy:
+          severidad: [urgente]
+
+    # ---------------- SNS: notificaciones por rol humano ----------------
+    TemaNotificaciones:
+      Type: AWS::SNS::Topic
+      Properties:
+        TopicName: TemaNotificaciones
+
+    SuscripcionTecnico:
+      Type: AWS::SNS::Subscription
+      Properties:
+        TopicArn: !Ref TemaNotificaciones
+        Protocol: email
+        Endpoint: ${env:EMAIL_TECNICO, 'tecnico@example.com'} # configurar EMAIL_TECNICO antes del deploy
+        FilterPolicyScope: MessageAttributes
+        FilterPolicy:
+          rol: [tecnico]
+
+    SuscripcionSupervisor:
+      Type: AWS::SNS::Subscription
+      Properties:
+        TopicArn: !Ref TemaNotificaciones
+        Protocol: email
+        Endpoint: ${env:EMAIL_SUPERVISOR, 'supervisor@example.com'} # configurar EMAIL_SUPERVISOR antes del deploy
+        FilterPolicyScope: MessageAttributes
+        FilterPolicy:
+          rol: [supervisor]
+
+    SuscripcionLogistica:
+      Type: AWS::SNS::Subscription
+      Properties:
+        TopicArn: !Ref TemaNotificaciones
+        Protocol: email
+        Endpoint: ${env:EMAIL_LOGISTICA, 'logistica@example.com'} # configurar EMAIL_LOGISTICA antes del deploy
+        FilterPolicyScope: MessageAttributes
+        FilterPolicy:
+          rol: [logistica]
+          repuesto_faltante: ['true']
+
+    SuscripcionOperador:
+      Type: AWS::SNS::Subscription
+      Properties:
+        TopicArn: !Ref TemaNotificaciones
+        Protocol: email
+        Endpoint: ${env:EMAIL_OPERADOR, 'operador@example.com'} # configurar EMAIL_OPERADOR antes del deploy
+        FilterPolicyScope: MessageAttributes
+        FilterPolicy:
+          rol: [operador]
+
+    # ---------------- DynamoDB ----------------
+    TablaMaquinas:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: t_maquinas
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: machine_id
+            AttributeType: S
+        KeySchema:
+          - AttributeName: machine_id
+            KeyType: HASH
+
+    TablaTecnicos:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: t_tecnicos
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: zona
+            AttributeType: S
+          - AttributeName: tecnico_id
+            AttributeType: S
+        KeySchema:
+          - AttributeName: zona
+            KeyType: HASH
+          - AttributeName: tecnico_id
+            KeyType: RANGE
+
+    TablaRepuestos:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: t_repuestos
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: zona
+            AttributeType: S
+          - AttributeName: repuesto_id
+            AttributeType: S
+        KeySchema:
+          - AttributeName: zona
+            KeyType: HASH
+          - AttributeName: repuesto_id
+            KeyType: RANGE
+
+    TablaIncidentes:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: t_incidentes
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: incidente_id
+            AttributeType: S
+          - AttributeName: machine_id
+            AttributeType: S
+          - AttributeName: fecha
+            AttributeType: S
+        KeySchema:
+          - AttributeName: incidente_id
+            KeyType: HASH
+        GlobalSecondaryIndexes:
+          - IndexName: MachineHistoryIndex
+            KeySchema:
+              - AttributeName: machine_id
+                KeyType: HASH
+              - AttributeName: fecha
+                KeyType: RANGE
+            Projection:
+              ProjectionType: ALL
+
+    TablaPedidosRepuesto:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: t_pedidos_repuesto
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: pedido_id
+            AttributeType: S
+          - AttributeName: estado
+            AttributeType: S
+          - AttributeName: fecha
+            AttributeType: S
+        KeySchema:
+          - AttributeName: pedido_id
+            KeyType: HASH
+        GlobalSecondaryIndexes:
+          - IndexName: EstadoFechaIndex
+            KeySchema:
+              - AttributeName: estado
+                KeyType: HASH
+              - AttributeName: fecha
+                KeyType: RANGE
+            Projection:
+              ProjectionType: ALL
+
+    # ---------------- Step Functions ----------------
+    FlujoAtencionIncidente:
+      Type: AWS::StepFunctions::StateMachine
+      Properties:
+        StateMachineName: FlujoAtencionIncidente
+        StateMachineType: STANDARD
+        RoleArn: arn:aws:iam::107681881936:role/LabRole
+        DefinitionString: |
+          {
+            "Comment": "Atención automatizada de incidentes urgentes de ArquiFusion Corp",
+            "StartAt": "ConsultarEstadoMaquina",
+            "States": {
+              "ConsultarEstadoMaquina": {
+                "Type": "Task",
+                "Resource": "arn:aws:lambda:us-east-1:107681881936:function:flujo2-dev-ConsultarEstadoMaquina",
+                "ResultPath": "$.machine",
+                "Retry": [{"ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"], "IntervalSeconds": 2, "MaxAttempts": 2, "BackoffRate": 2.0}],
+                "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "AvisarSupervisorError"}],
+                "Next": "AsignarTecnico"
+              },
+              "AsignarTecnico": {
+                "Type": "Task",
+                "Resource": "arn:aws:lambda:us-east-1:107681881936:function:flujo2-dev-AsignarTecnico",
+                "ResultPath": "$.asignacion",
+                "Retry": [{"ErrorEquals": ["States.ALL"], "IntervalSeconds": 2, "MaxAttempts": 2, "BackoffRate": 2.0}],
+                "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "AvisarSupervisorError"}],
+                "Next": "VerificarRepuestos"
+              },
+              "VerificarRepuestos": {
+                "Type": "Task",
+                "Resource": "arn:aws:lambda:us-east-1:107681881936:function:flujo2-dev-VerificarRepuestos",
+                "ResultPath": "$.repuesto_check",
+                "Retry": [{"ErrorEquals": ["States.ALL"], "IntervalSeconds": 2, "MaxAttempts": 2, "BackoffRate": 2.0}],
+                "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "AvisarSupervisorError"}],
+                "Next": "HayRepuesto"
+              },
+              "HayRepuesto": {
+                "Type": "Choice",
+                "Choices": [{"Variable": "$.repuesto_check.hay_repuesto", "BooleanEquals": true, "Next": "RegistrarIncidente"}],
+                "Default": "SolicitarRepuesto"
+              },
+              "SolicitarRepuesto": {
+                "Type": "Task",
+                "Resource": "arn:aws:lambda:us-east-1:107681881936:function:flujo2-dev-SolicitarRepuesto",
+                "ResultPath": "$.pedido",
+                "Retry": [{"ErrorEquals": ["States.ALL"], "IntervalSeconds": 2, "MaxAttempts": 2, "BackoffRate": 2.0}],
+                "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "AvisarSupervisorError"}],
+                "Next": "RegistrarIncidente"
+              },
+              "RegistrarIncidente": {
+                "Type": "Task",
+                "Resource": "arn:aws:lambda:us-east-1:107681881936:function:flujo2-dev-RegistrarIncidente",
+                "ResultPath": "$.registro",
+                "Retry": [{"ErrorEquals": ["States.ALL"], "IntervalSeconds": 2, "MaxAttempts": 2, "BackoffRate": 2.0}],
+                "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "AvisarSupervisorError"}],
+                "Next": "NotificarIncidente"
+              },
+              "NotificarIncidente": {
+                "Type": "Task",
+                "Resource": "arn:aws:lambda:us-east-1:107681881936:function:flujo2-dev-NotificarIncidente",
+                "End": true,
+                "Retry": [{"ErrorEquals": ["States.ALL"], "IntervalSeconds": 2, "MaxAttempts": 2, "BackoffRate": 2.0}],
+                "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "AvisarSupervisorError"}]
+              },
+              "AvisarSupervisorError": {
+                "Type": "Task",
+                "Resource": "arn:aws:lambda:us-east-1:107681881936:function:flujo2-dev-NotificarIncidente",
+                "End": true
+              }
+            }
+          }
+
+  Outputs:
+    TemaIncidentesArn:
+      Description: ARN del topic de entrada (para pruebas o integracion con Flujo 1)
+      Value: !Ref TemaIncidentes
+    TemaNotificacionesArn:
+      Description: ARN del topic de notificaciones
+      Value: !Ref TemaNotificaciones
+    ColaIncidentesUrl:
+      Value: !Ref ColaIncidentes
+    ColaIncidentesDLQUrl:
+      Value: !Ref ColaIncidentesDLQ
+    StateMachineArn:
+      Value: !Ref FlujoAtencionIncidente
