@@ -3,15 +3,6 @@
 Implementación inicial del diagrama `Flujo 2 - Atención de incidentes`.
 Incluye las 9 Lambdas, Step Functions, SNS, SQS + DLQ, DynamoDB y API Gateway.
 
-## Cuenta y región
-
-- Cuenta AWS esperada: `107681881936`
-- Región: `us-east-1`
-- Stage: `dev`
-- Runtime: Python 3.12
-- Rol IAM: rol preexistente `LabRole` (no se crea ningún rol IAM nuevo).
-
-> La definición de Step Functions contiene ARNs de Lambda con la cuenta indicada y nombres `flujo2-dev-*`. Despliega con `--stage dev` en esa cuenta y región. Si cambias de cuenta, región o stage, actualiza los ARNs del estado en `serverless.yml`.
 
 ## Arquitectura implementada
 
